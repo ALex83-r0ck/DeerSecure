@@ -1,477 +1,308 @@
+import os
 import asyncio
 import hashlib
-import os
 import shutil
 import subprocess
 import sqlite3
+import threading
+import logging
+import json
 from datetime import datetime, timedelta
+
+# Kivy & KivyMD Imports
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from kivy.app import App
-from kivy.clock import Clock
-from kivy.uix.filechooser import FileChooserListView
-from kivymd.app import MDApp
-from kivymd.uix.screen import MDScreen
-from kivymd.uix.screenmanager import ScreenManager
-from kivymd.uix.button import MDRaisedButton, MDFlatButton
-from kivymd.uix.label import MDLabel
-from kivymd.uix.snackbar import MDSnackbar
-from kivymd.uix.dialog import MDDialog
-from kivymd.uix.list import OneLineListItem
-from kivymd.uix.boxlayout import MDBoxLayout
-from kivymd.uix.scrollview import MDScrollView
-import vt
+from kivy.clock import Clock #type: ignore
+from kivy.lang import Builder #type: ignore
+from kivymd.app import MDApp #type: ignore
+from kivymd.uix.screen import MDScreen #type: ignore
+from kivymd.uix.screenmanager import ScreenManager #type: ignore
+from kivymd.uix.button import MDRaisedButton, MDFlatButton #type: ignore
+from kivymd.uix.label import MDLabel #type: ignore
+from kivymd.uix.snackbar import MDSnackbar #type: ignore
+from kivymd.uix.dialog import MDDialog #type: ignore
+from kivymd.uix.list import OneLineListItem, TwoLineListItem #type: ignore
+from kivymd.uix.boxlayout import MDBoxLayout #type: ignore
+from kivymd.uix.scrollview import MDScrollView #type: ignore
+import vt #type: ignore
+
+# ---------------------------------------------------------
+# LOGGER SETUP
+# ---------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("deersecure_internal.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("DeerSecure")
+
+# ---------------------------------------------------------
+# KV-LAYOUT (GUI-Struktur)
+# ---------------------------------------------------------
+KV = '''
+MDBoxLayout:
+    orientation: "vertical"
+
+    MDTopAppBar:
+        title: "DeerSecure Monitor"
+        elevation: 4
+        left_action_items: [["menu", lambda x: nav_drawer.set_state("open")]]
+        right_action_items: [["shield-check", lambda x: app.run_defender_scan()]]
+
+    MDNavigationLayout:
+        ScreenManager:
+            id: screen_manager
+            
+            MDScreen:
+                name: "dashboard"
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: "10dp"
+                    spacing: "10dp"
+                    
+                    MDLabel:
+                        text: "System-Status: Geschützt"
+                        halign: "center"
+                        font_style: "H5"
+                        size_hint_y: None
+                        height: "50dp"
+
+                    MDScrollView:
+                        MDList:
+                            id: log_list  # Hier landen die Echtzeit-Logs
+
+            MDScreen:
+                name: "quarantine"
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: "10dp"
+                    MDLabel:
+                        text: "Quarantäne-Bereich"
+                        halign: "center"
+                        size_hint_y: None
+                        height: "40dp"
+                    MDScrollView:
+                        MDList:
+                            id: quarantine_list
+
+        MDNavigationDrawer:
+            id: nav_drawer
+            MDBoxLayout:
+                orientation: "vertical"
+                padding: "8dp"
+                spacing: "8dp"
+                
+                MDLabel:
+                    text: "DeerSecure Menü"
+                    font_style: "Button"
+                    size_hint_y: None
+                    height: "50dp"
+                
+                MDRaisedButton:
+                    text: "Dashboard"
+                    size_hint_x: 1
+                    on_release: 
+                        screen_manager.current = "dashboard"
+                        nav_drawer.set_state("close")
+                
+                MDRaisedButton:
+                    text: "Quarantäne"
+                    size_hint_x: 1
+                    on_release: 
+                        app.show_quarantine()
+                        nav_drawer.set_state("close")
+                
+                MDRaisedButton:
+                    text: "Defender Historie"
+                    size_hint_x: 1
+                    on_release: 
+                        app.check_defender_history()
+                        nav_drawer.set_state("close")
+'''
+
+# ---------------------------------------------------------
+# LOGIK-KLASSEN
+# ---------------------------------------------------------
 
 class FileWatcher(FileSystemEventHandler):
+    """Überwacht Dateisystem-Events und meldet sie an die App."""
     def __init__(self, app):
         self.app = app
 
     def on_created(self, event):
         if not event.is_directory:
-            file_path = event.src_path
-            # Verwende Kivy's Clock für Thread-sichere GUI-Updates
-            Clock.schedule_once(lambda dt: self.app.schedule_file_check(file_path), 0)
+            logger.info(f"Neue Datei erkannt: {event.src_path}")
+            # Übergabe an Kivy-Thread
+            Clock.schedule_once(lambda dt: self.app.process_new_file(event.src_path), 0)
 
-class DeerHunterApp(MDApp):  # MDApp statt App verwenden
+class DeerHunterApp(MDApp):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # WICHTIG: API-Key sollte aus Umgebungsvariable oder Config-Datei geladen werden
-        self.api_key = os.getenv("VIRUSTOTAL_API_KEY", "DEIN_API_KEY_HIER")
+        self.api_key = os.getenv("VIRUSTOTAL_API_KEY", "DEIN_API_KEY")
         self.quarantine_dir = "C:/DeerSecure/Quarantine"
-        # Korrektur: watch_dir als Liste definieren
-        self.watch_dirs = ["C:/Users/Public", "C:/Users/Student/Downloads"]
-        self.observers = []  # Liste für mehrere Observer
+        self.watch_dirs = ["C:/Users/Public", os.path.join(os.path.expanduser("~"), "Downloads")]
         self.cache_db = "deersecure_cache.db"
-        self.init_database()
-
-    def init_database(self):
-        """Initialisiert die Cache-Datenbank"""
-        try:
-            conn = sqlite3.connect(self.cache_db)
-            c = conn.cursor()
-            c.execute("""CREATE TABLE IF NOT EXISTS cache 
-                        (hash TEXT PRIMARY KEY, 
-                         result TEXT, 
-                         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"Fehler beim Initialisieren der Datenbank: {e}")
+        self.observers = []
 
     def build(self):
-        self.sm = ScreenManager()
-        
-        # Hauptbildschirm
-        main_screen = MDScreen(name="main")
-        main_layout = MDBoxLayout(orientation="vertical", spacing="20dp", padding="20dp")
-        
-        main_layout.add_widget(MDLabel(
-            text="DeerSecure: Schutz vor Schadsoftware",
-            halign="center",
-            theme_text_color="Primary",
-            size_hint_y=None,
-            height="40dp"
-        ))
-        
-        main_layout.add_widget(MDRaisedButton(
-            text="Datei scannen",
-            size_hint=(None, None),
-            size=("200dp", "40dp"),
-            pos_hint={"center_x": 0.5},
-            on_press=self.show_file_chooser
-        ))
-        
-        main_layout.add_widget(MDRaisedButton(
-            text="Quarantäne anzeigen",
-            size_hint=(None, None),
-            size=("200dp", "40dp"),
-            pos_hint={"center_x": 0.5},
-            on_press=lambda x: self.show_quarantine()
-        ))
-        
-        main_layout.add_widget(MDRaisedButton(
-            text="Defender-Scan jetzt",
-            size_hint=(None, None),
-            size=("200dp", "40dp"),
-            pos_hint={"center_x": 0.5},
-            on_press=self.run_defender_scan
-        ))
-        
-        main_screen.add_widget(main_layout)
-        
-        # Dateiauswahl-Bildschirm
-        file_screen = MDScreen(name="file_chooser")
-        file_layout = MDBoxLayout(orientation="vertical", spacing="10dp", padding="10dp")
-        
-        # Verwende den ersten verfügbaren Pfad
-        initial_path = next((path for path in self.watch_dirs if os.path.exists(path)), os.path.expanduser("~"))
-        self.file_chooser = FileChooserListView(path=initial_path)
-        file_layout.add_widget(self.file_chooser)
-        
-        button_layout = MDBoxLayout(orientation="horizontal", size_hint_y=None, height="40dp", spacing="10dp")
-        button_layout.add_widget(MDRaisedButton(
-            text="Auswählen",
-            on_press=self.scan_selected_file
-        ))
-        button_layout.add_widget(MDRaisedButton(
-            text="Zurück",
-            on_press=lambda x: setattr(self.sm, 'current', 'main')
-        ))
-        file_layout.add_widget(button_layout)
-        file_screen.add_widget(file_layout)
-        
-        # Quarantäne-Bildschirm
-        quarantine_screen = MDScreen(name="quarantine")
-        quarantine_layout = MDBoxLayout(orientation="vertical", spacing="10dp", padding="10dp")
-        
-        quarantine_layout.add_widget(MDLabel(
-            text="Quarantäne-Dateien",
-            halign="center",
-            size_hint_y=None,
-            height="40dp"
-        ))
-        
-        # Scrollbare Liste für Quarantäne-Dateien
-        scroll = MDScrollView()
-        self.quarantine_list = MDBoxLayout(orientation="vertical", adaptive_height=True)
-        scroll.add_widget(self.quarantine_list)
-        quarantine_layout.add_widget(scroll)
-        
-        quarantine_layout.add_widget(MDRaisedButton(
-            text="Zurück",
-            size_hint_y=None,
-            height="40dp",
-            on_press=lambda x: setattr(self.sm, 'current', 'main')
-        ))
-        
-        quarantine_screen.add_widget(quarantine_layout)
-        
-        self.sm.add_widget(main_screen)
-        self.sm.add_widget(file_screen)
-        self.sm.add_widget(quarantine_screen)
-        
-        # Starte Dateiüberwachung
-        self.start_watching()
-        
-        # Plane Defender-Scan
-        self.schedule_defender_scan()
-        
-        return self.sm
+        self.theme_cls.primary_palette = "Blue"
+        self.init_database()
+        return Builder.load_string(KV)
 
-    def start_watching(self):
-        """Startet die Dateiüberwachung für alle konfigurierten Verzeichnisse"""
-        for watch_dir in self.watch_dirs:
-            if os.path.exists(watch_dir):
-                observer = Observer()
-                event_handler = FileWatcher(self)
-                observer.schedule(event_handler, watch_dir, recursive=True)
-                observer.start()
-                self.observers.append(observer)
-                print(f"Überwachung gestartet für: {watch_dir}")
+    def init_database(self):
+        """Erstellt die Cache-DB für Scan-Ergebnisse."""
+        conn = sqlite3.connect(self.cache_db)
+        conn.execute("""CREATE TABLE IF NOT EXISTS cache 
+                        (hash TEXT PRIMARY KEY, result TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        conn.close()
 
-    def show_file_chooser(self, instance):
-        self.sm.current = "file_chooser"
-
-    def show_quarantine(self):
-        self.update_quarantine_list()
-        self.sm.current = "quarantine"
-
-    def scan_selected_file(self, instance):
-        selected = self.file_chooser.selection
-        if selected:
-            file_path = selected[0]
-            self.schedule_file_check(file_path)
-            self.sm.current = "main"
-        else:
-            self.show_snackbar("Keine Datei ausgewählt")
-
-    def schedule_file_check(self, file_path):
-        """Plant eine asynchrone Dateiprüfung"""
-        asyncio.create_task(self.check_file(file_path))
-
-    def get_file_hash(self, file_path):
-        """Berechnet SHA256-Hash einer Datei"""
-        try:
-            sha256_hash = hashlib.sha256()
-            with open(file_path, "rb") as f:
-                for byte_block in iter(lambda: f.read(4096), b""):
-                    sha256_hash.update(byte_block)
-            return sha256_hash.hexdigest()
-        except Exception as e:
-            print(f"Fehler beim Berechnen des Hash: {e}")
-            return None
-
-    def cache_result(self, file_hash, result):
-        """Speichert Scan-Ergebnis im Cache"""
-        try:
-            conn = sqlite3.connect(self.cache_db)
-            c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO cache (hash, result) VALUES (?, ?)", 
-                     (file_hash, str(result)))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"Fehler beim Cachen: {e}")
-
-    def check_cached_result(self, file_hash):
-        """Prüft, ob ein Ergebnis im Cache vorhanden ist"""
-        try:
-            conn = sqlite3.connect(self.cache_db)
-            c = conn.cursor()
-            c.execute("SELECT result, timestamp FROM cache WHERE hash = ?", (file_hash,))
-            result = c.fetchone()
-            conn.close()
-            
-            if result:
-                # Cache ist 24 Stunden gültig
-                cache_time = datetime.fromisoformat(result[1])
-                if datetime.now() - cache_time < timedelta(hours=24):
-                    return result[0]
-            return None
-        except Exception as e:
-            print(f"Fehler beim Cache-Check: {e}")
-            return None
-
-    async def check_file(self, file_path):
-        """Prüft eine Datei mit VirusTotal API"""
-        if not os.path.exists(file_path):
-            self.show_snackbar("Datei nicht gefunden")
+    def add_log_to_ui(self, message):
+        """Fügt eine Nachricht direkt in die Liste im Dashboard ein."""
+        if self.root is None:
             return
-
-        file_hash = self.get_file_hash(file_path)
-        if not file_hash:
-            return
-
-        filename = os.path.basename(file_path)
-
-        # Prüfe Cache
-        cached_result = self.check_cached_result(file_hash)
-        if cached_result:
-            try:
-                result_dict = eval(cached_result)  # Vorsicht: eval verwenden
-                if isinstance(result_dict, dict) and result_dict.get("malicious", 0) > 0:
-                    self.quarantine_file(file_path)
-                    self.show_snackbar(f"Datei {filename} ist verdächtig (aus Cache)!")
-                else:
-                    self.show_snackbar(f"Datei {filename} ist sicher (aus Cache)")
-            except:
-                pass
-            return
-
-        # VirusTotal API-Abfrage
-        if self.api_key == "6fbbd41a847b24b741a5140b8019ef84cd100c7a949ef81908d178d1506aed53":
-            self.show_snackbar("Bitte VirusTotal API-Key konfigurieren")
-            return
-
-        try:
-            async with vt.Client(self.api_key) as client:
-                try:
-                    # Korrekte Verwendung der VirusTotal API
-                    file_report = client.get_object(f"/files/{file_hash}")
-                    stats = file_report.last_analysis_stats
-                    positives = getattr(stats, "malicious", 0)
-                    
-                    # Cache das Ergebnis
-                    cache_data = {
-                        "malicious": positives,
-                        "suspicious": getattr(stats, "suspicious", 0),
-                        "harmless": getattr(stats, "harmless", 0),
-                        "undetected": getattr(stats, "undetected", 0)
-                    }
-                    self.cache_result(file_hash, str(cache_data))
-                    
-                    if positives > 0:
-                        self.quarantine_file(file_path)
-                        self.show_snackbar(f"Bedrohung erkannt in {filename}! Positives: {positives}")
-                    else:
-                        self.show_snackbar(f"Keine Bedrohung in {filename} gefunden")
-                        
-                except vt.error.APIError as e:
-                    if e.code == "NotFoundError":
-                        self.show_snackbar(f"Datei {filename} nicht in VirusTotal-Datenbank")
-                        # Optional: Datei hochladen (nur kleine Dateien)
-                        if os.path.getsize(file_path) < 32 * 1024 * 1024:  # 32MB Limit
-                            await self.upload_file(file_path)
-                    else:
-                        self.show_snackbar(f"VirusTotal-Fehler: {str(e)}")
-        except Exception as e:
-            self.show_snackbar(f"Fehler bei der Dateiprüfung: {str(e)}")
-
-    async def upload_file(self, file_path):
-        """Lädt eine Datei zur Analyse zu VirusTotal hoch"""
-        try:
-            async with vt.Client(self.api_key) as client:
-                with open(file_path, "rb") as f:
-                    analysis = client.scan_file(f)
-                
-                # Warte auf Analyse-Ergebnis (mit Timeout)
-                filename = os.path.basename(file_path)
-                self.show_snackbar(f"Datei {filename} wurde zur Analyse hochgeladen")
-                
-                # Einfache Behandlung - keine Warte-Schleife da die API async ist
-                try:
-                    # Versuche nach kurzer Zeit das Ergebnis abzurufen
-                    await asyncio.sleep(5)  # Kurz warten
-                    analysis_obj = client.get_object(f"/analyses/{analysis.id}")
-                    
-                    if hasattr(analysis_obj, 'stats'):
-                        stats = analysis_obj.stats
-                        positives = getattr(stats, "malicious", 0)
-                        
-                        cache_data = {
-                            "malicious": positives,
-                            "suspicious": getattr(stats, "suspicious", 0),
-                            "harmless": getattr(stats, "harmless", 0),
-                            "undetected": getattr(stats, "undetected", 0)
-                        }
-                        self.cache_result(self.get_file_hash(file_path), str(cache_data))
-                        
-                        if positives > 0:
-                            self.quarantine_file(file_path)
-                            self.show_snackbar(f"Upload-Scan: Bedrohung erkannt in {filename}!")
-                        else:
-                            self.show_snackbar(f"Upload-Scan: Keine Bedrohung in {filename}")
-                    else:
-                        self.show_snackbar(f"Upload-Analyse für {filename} läuft noch")
-                        
-                except Exception as inner_e:
-                    self.show_snackbar(f"Upload-Analyse noch nicht verfügbar: {str(inner_e)}")
-                    
-        except Exception as e:
-            self.show_snackbar(f"Upload fehlgeschlagen: {str(e)}")
-
-    def quarantine_file(self, file_path):
-        """Verschiebt eine Datei in die Quarantäne"""
-        try:
-            os.makedirs(self.quarantine_dir, exist_ok=True)
-            filename = os.path.basename(file_path)
-            dest_path = os.path.join(self.quarantine_dir, filename)
-            
-            # Verhindere Überschreibung durch Zeitstempel
-            if os.path.exists(dest_path):
-                name, ext = os.path.splitext(filename)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                dest_path = os.path.join(self.quarantine_dir, f"{name}_{timestamp}{ext}")
-            
-            shutil.move(file_path, dest_path)
-            self.update_quarantine_list()
-            return True
-        except Exception as e:
-            self.show_snackbar(f"Quarantäne fehlgeschlagen: {str(e)}")
-            return False
-
-    def update_quarantine_list(self):
-        """Aktualisiert die Quarantäne-Liste"""
-        self.quarantine_list.clear_widgets()
-        if os.path.exists(self.quarantine_dir):
-            for file in os.listdir(self.quarantine_dir):
-                item = OneLineListItem(
-                    text=file,
-                    on_press=lambda x, f=file: self.restore_file(f)
-                )
-                self.quarantine_list.add_widget(item)
-
-    def restore_file(self, filename):
-        """Stellt eine Datei aus der Quarantäne wieder her"""
-        def confirm_restore(dialog_instance):
-            try:
-                src_path = os.path.join(self.quarantine_dir, filename)
-                # Verwende Desktop als Wiederherstellungsort
-                dest_dir = os.path.join(os.path.expanduser("~"), "Desktop", "Restored")
-                os.makedirs(dest_dir, exist_ok=True)
-                dest_path = os.path.join(dest_dir, filename)
-                
-                shutil.move(src_path, dest_path)
-                self.update_quarantine_list()
-                self.show_snackbar(f"Datei {filename} auf Desktop wiederhergestellt")
-            except Exception as e:
-                self.show_snackbar(f"Wiederherstellung fehlgeschlagen: {str(e)}")
-            dialog_instance.dismiss()
-
-        dialog = MDDialog(
-            title="Datei wiederherstellen",
-            text=f"Möchtest du {filename} aus der Quarantäne wiederherstellen?",
-            buttons=[
-                MDFlatButton(text="Abbrechen", on_release=lambda x: dialog.dismiss()),
-                MDFlatButton(text="Wiederherstellen", on_release=confirm_restore)
-            ]
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.root.ids.log_list.add_widget(
+            OneLineListItem(text=f"[{timestamp}] {message}")
         )
-        dialog.open()
 
-    def run_defender_scan(self, instance=None):
-        """Führt einen Windows Defender Scan aus"""
-        try:
-            # Prüfe, ob Windows Defender verfügbar ist
-            result = subprocess.run(
-                ["powershell", "Get-Command Start-MpScan"], 
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode != 0:
-                self.show_snackbar("Windows Defender nicht verfügbar")
-                return
+    # --- DATEIÜBERWACHUNG ---
+    def on_start(self):
+        """Wird beim Start der App ausgeführt."""
+        for path in self.watch_dirs:
+            if os.path.exists(path):
+                obs = Observer()
+                obs.schedule(FileWatcher(self), path, recursive=True)
+                obs.start()
+                self.observers.append(obs)
+                logger.info(f"Überwachung aktiv: {path}")
+                self.add_log_to_ui(f"Überwachung gestartet: {path}")
 
-            subprocess.run(
-                ["powershell", "Start-MpScan -ScanType QuickScan"], 
-                check=True, timeout=300
-            )
-            
-            # Prüfe Bedrohungen
-            result = subprocess.run(
-                ["powershell", "Get-MpThreat"], 
-                capture_output=True, text=True, timeout=30
-            )
-            
-            if not result.stdout.strip() or "No threats" in result.stdout:
-                self.show_snackbar("Defender-Scan: Keine Bedrohungen gefunden")
-            else:
-                self.show_snackbar("Defender-Scan: Bedrohung erkannt!")
-                
-        except subprocess.TimeoutExpired:
-            self.show_snackbar("Defender-Scan Timeout")
-        except Exception as e:
-            self.show_snackbar(f"Defender-Scan fehlgeschlagen: {str(e)}")
+    def process_new_file(self, file_path):
+        """Startet die Prüfung in einem Thread, um UI-Freeze zu verhindern."""
+        threading.Thread(target=self.run_security_checks, args=(file_path,), daemon=True).start()
 
-    def schedule_defender_scan(self):
-        """Plant den täglichen Defender-Scan um 22:00 Uhr"""
-        now = datetime.now()
-        target_time = now.replace(hour=22, minute=0, second=0, microsecond=0)
-        
-        # Wenn es bereits nach 22:00 ist, plane für den nächsten Tag
-        if now >= target_time:
-            target_time += timedelta(days=1)
-        
-        seconds_until = (target_time - now).total_seconds()
-        Clock.schedule_once(lambda dt: self.run_defender_scan(), seconds_until)
-        
-        # Nach dem Scan, plane den nächsten
-        Clock.schedule_once(lambda dt: self.schedule_defender_scan(), seconds_until + 1)
+    def run_security_checks(self, file_path):
+        """Kombinierte Prüfung: Cache -> VirusTotal."""
+        file_hash = self.get_file_hash(file_path)
+        if not file_hash: return
 
-    def show_snackbar(self, text):
-        """Zeigt eine Snackbar-Nachricht an"""
-        try:
-            snackbar = MDSnackbar(
-                MDLabel(text=text, theme_text_color="Custom"),
-                snackbar_x="10dp",
-                snackbar_y="10dp"
-            )
-            snackbar.open()
-        except:
-            # Fallback für ältere KivyMD Versionen
-            MDSnackbar(text=text).open()
+        # 1. Cache Check
+        cached = self.check_cache(file_hash)
+        if cached:
+            self.handle_scan_result(file_path, json.loads(cached), from_cache=True)
+            return
 
-    def on_stop(self):
-        """Wird beim Beenden der App aufgerufen"""
-        for observer in self.observers:
-            observer.stop()
-            observer.join()
-
-if __name__ == "__main__":
-    # Erstelle Event Loop für asyncio
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
+        # 2. VirusTotal Check (Async-Wrapper für Thread)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    
-    app = DeerHunterApp()
-    app.run()
+        result = loop.run_until_complete(self.vt_scan(file_hash))
+        self.handle_scan_result(file_path, result)
+
+    async def vt_scan(self, file_hash):
+        """Abfrage der VirusTotal API."""
+        try:
+            async with vt.Client(self.api_key) as client:
+                file_obj = await client.get_object_async(f"/files/{file_hash}")
+                stats = file_obj.last_analysis_stats
+                res = {"malicious": stats.get("malicious", 0)}
+                self.save_to_cache(file_hash, res)
+                return res
+        except Exception as e:
+            logger.error(f"VT Fehler: {e}")
+            return {"error": str(e)}
+
+    def handle_scan_result(self, file_path, result, from_cache=False):
+        """Entscheidet, ob eine Datei in Quarantäne muss."""
+        name = os.path.basename(file_path)
+        malicious_count = result.get("malicious", 0)
+
+        if malicious_count > 0:
+            Clock.schedule_once(lambda dt: self.add_log_to_ui(f"WARNUNG: {name} ist bösartig!"), 0)
+            self.move_to_quarantine(file_path)
+        else:
+            msg = f"Datei sicher: {name}" + (" (Cache)" if from_cache else "")
+            Clock.schedule_once(lambda dt: self.add_log_to_ui(msg), 0)
+
+    # --- DEFENDER INTEGRATION ---
+    def run_defender_scan(self):
+        """Startet Defender QuickScan ohne die UI einzufrieren."""
+        self.add_log_to_ui("Defender Scan gestartet...")
+        
+        def scan():
+            try:
+                # Nutze PowerShell für den Scan
+                subprocess.run(["powershell", "-Command", "Start-MpScan -ScanType QuickScan"], capture_output=True)
+                Clock.schedule_once(lambda dt: self.add_log_to_ui("Defender Scan beendet."), 0)
+            except Exception as e:
+                logger.error(f"Defender Fehler: {e}")
+
+        threading.Thread(target=scan, daemon=True).start()
+
+    def check_defender_history(self):
+        """Liest die letzten Funde von Windows Defender aus."""
+        try:
+            cmd = "Get-MpThreatDetection | Select-Object -First 5 | ConvertTo-Json"
+            res = subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True)
+            if res.stdout:
+                # Hier könnte man ein Dialogfenster mit den Funden öffnen
+                self.add_log_to_ui("Defender Historie abgerufen (siehe Logfile)")
+                logger.info(f"Defender History: {res.stdout}")
+            else:
+                self.add_log_to_ui("Keine Defender-Funde in der Historie.")
+        except Exception as e:
+            logger.error(f"Fehler beim Auslesen der Historie: {e}")
+
+    # --- HILFSFUNKTIONEN ---
+    def get_file_hash(self, path):
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""): h.update(chunk)
+            return h.hexdigest()
+        except: return None
+
+    def save_to_cache(self, f_hash, data):
+        conn = sqlite3.connect(self.cache_db)
+        conn.execute("INSERT OR REPLACE INTO cache (hash, result) VALUES (?, ?)", (f_hash, json.dumps(data)))
+        conn.commit()
+        conn.close()
+
+    def check_cache(self, f_hash):
+        conn = sqlite3.connect(self.cache_db)
+        res = conn.execute("SELECT result FROM cache WHERE hash=?", (f_hash,)).fetchone()
+        conn.close()
+        return res[0] if res else None
+
+    def move_to_quarantine(self, path):
+        """Verschiebt Datei und entzieht Rechte."""
+        if not os.path.exists(self.quarantine_dir): os.makedirs(self.quarantine_dir)
+        try:
+            dest = os.path.join(self.quarantine_dir, os.path.basename(path))
+            shutil.move(path, dest)
+            # Simpler Schutz: Dateiendung ändern
+            os.rename(dest, dest + ".locked")
+            logger.warning(f"Datei in Quarantäne: {dest}")
+        except Exception as e:
+            logger.error(f"Quarantäne Fehler: {e}")
+
+    def show_quarantine(self):
+        """Zeigt Dateien im Quarantäne-Ordner an."""
+        if self.root is None:
+            return
+        self.root.ids.screen_manager.current = "quarantine"
+        list_widget = self.root.ids.quarantine_list
+        list_widget.clear_widgets()
+        if os.path.exists(self.quarantine_dir):
+            for f in os.listdir(self.quarantine_dir):
+                list_widget.add_widget(OneLineListItem(text=f))
+
+    def on_stop(self):
+        for obs in self.observers:
+            obs.stop()
+            obs.join()
+
+if __name__ == "__main__":
+    DeerHunterApp().run()
