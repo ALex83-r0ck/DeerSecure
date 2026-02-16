@@ -77,16 +77,3 @@ Wir testen die Logik isoliert (ohne UI). Dazu nutzen wir pytest.
 File-to-Log-Flow: Eine Testdatei in den Download-Ordner legen und prüfen, ob nach X Sekunden ein Log-Eintrag in der UI-Liste erscheint.
 
 VT-Mocking: Die VirusTotal API simulieren, um keine echten Credits zu verbrauchen und "Malicious"-Funde zu testen.
-
-Beispiel für einen ersten Test (tests/test_logic.py):
-´´´python
-    import pytest
-    from DeerSecure.deer_hunter import DeerHunterApp
-    def test_hash_calculation():
-        # Teste mit einer temporären Datei
-        with open("test.txt", "w") as f:
-            f.write("DeerSecure Test")
-    app = DeerHunterApp()
-    file_hash = app.get_file_hash_with_retry("test.txt")
-    assert file_hash is not None
-    assert len(file_hash) == 64  # SHA256 Länge
